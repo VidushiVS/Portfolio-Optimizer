@@ -1,0 +1,681 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import optimize, stats, linalg
+from typing import Dict, List, Tuple, Optional, Union, Callable
+import warnings
+from dataclasses import dataclass, field
+import yfinance as yf
+from datetime import datetime, timedelta
+
+warnings.filterwarnings('ignore')
+
+@dataclass
+class Constraints:
+    min_weights: Dict[str, float] = field(default_factory=dict)
+    max_weights: Dict[str, float] = field(default_factory=dict)
+    max_turnover: Optional[float] = None
+    max_concentration: Optional[float] = None
+    sector_limits: Dict[str, Tuple[float, float]] = field(default_factory=dict)
+    leverage_limit: float = 1.0
+    long_only: bool = True
+
+@dataclass
+class MarketView:
+    assets: List[str]
+    expected_return: float
+    confidence: float  # 0-1
+    view_type: str = 'absolute'  # or 'relative'
+
+class RiskModel:
+    def estimate_covariance(self, returns):
+        pass
+    
+    def get_risk_factors(self, returns):
+        pass
+
+class SampleCovariance(RiskModel):
+    def __init__(self, lookback=252, shrinkage=0.1):
+        self.lookback = lookback
+        self.shrinkage = shrinkage
+    
+    def estimate_covariance(self, returns):
+        # ledoit-wolf shrinkage
+        if len(returns) < self.lookback:
+            data = returns
+        else:
+            data = returns.tail(self.lookback)
+        
+        sample_cov = data.cov().values
+        
+        # shrinkage target - diagonal matrix
+        avg_var = np.trace(sample_cov) / len(sample_cov)
+        target = avg_var * np.eye(len(sample_cov))
+        
+        # shrunk estimator
+        shrunk_cov = (1 - self.shrinkage) * sample_cov + self.shrinkage * target
+        return shrunk_cov
+    
+    def get_risk_factors(self, returns):
+        return {'idiosyncratic': returns.values}
+
+class FactorModel(RiskModel):
+    def __init__(self, n_factors=5):
+        self.n_factors = n_factors
+        self.loadings = None
+        self.factor_rets = None
+        self.specific_risk = None
+    
+    def estimate_covariance(self, returns):
+        # pca factor model
+        standardized = (returns - returns.mean()) / returns.std()
+        cov_mat = standardized.cov().values
+        
+        eigenvals, eigenvecs = linalg.eigh(cov_mat)
+        
+        # top factors
+        idx = np.argsort(eigenvals)[::-1]
+        loadings = eigenvecs[:, idx[:self.n_factors]] * np.sqrt(eigenvals[idx[:self.n_factors]])
+        
+        factor_rets = standardized.values @ eigenvecs[:, idx[:self.n_factors]]
+        
+        # specific risks
+        residual_var = np.diag(cov_mat) - np.sum(loadings**2, axis=1)
+        specific_risk = np.maximum(residual_var, 0.01)  # 1% floor
+        
+        self.loadings = loadings
+        self.factor_rets = factor_rets
+        self.specific_risk = specific_risk
+        
+        # reconstruct covariance
+        factor_cov = np.cov(factor_rets.T)
+        reconstructed = loadings @ factor_cov @ loadings.T + np.diag(specific_risk)
+        return reconstructed
+    
+    def get_risk_factors(self, returns):
+        if self.loadings is None:
+            self.estimate_covariance(returns)
+        
+        return {
+            'loadings': self.loadings,
+            'factor_returns': self.factor_rets,
+            'specific_risk': self.specific_risk
+        }
+
+class Objective:
+    def objective_function(self, weights, returns, cov_matrix, **kwargs):
+        pass
+    
+    def gradient(self, weights, returns, cov_matrix, **kwargs):
+        pass
+
+class MeanVariance(Objective):
+    def __init__(self, risk_aversion=1.0):
+        self.risk_aversion = risk_aversion
+    
+    def objective_function(self, weights, returns, cov_matrix, **kwargs):
+        # maximize utility: return - 0.5 * risk_aversion * variance
+        expected_rets = returns.mean().values
+        port_return = weights @ expected_rets
+        port_variance = weights @ cov_matrix @ weights
+        
+        utility = port_return - 0.5 * self.risk_aversion * port_variance
+        return -utility  # minimize negative utility
+    
+    def gradient(self, weights, returns, cov_matrix, **kwargs):
+        expected_rets = returns.mean().values
+        return -(expected_rets - self.risk_aversion * cov_matrix @ weights)
+
+class RiskParity(Objective):
+    def objective_function(self, weights, returns, cov_matrix, **kwargs):
+        # minimize sum of squared deviations from equal risk contrib
+        port_variance = weights @ cov_matrix @ weights
+        marginal_contrib = cov_matrix @ weights
+        risk_contrib = weights * marginal_contrib / port_variance
+        
+        target_risk = 1.0 / len(weights)
+        deviations = risk_contrib - target_risk
+        return np.sum(deviations**2)
+    
+    def gradient(self, weights, returns, cov_matrix, **kwargs):
+        # numerical gradient - analytical is complex
+        eps = 1e-8
+        n = len(weights)
+        grad = np.zeros(n)
+        
+        for i in range(n):
+            w_plus = weights.copy()
+            w_plus[i] += eps
+            w_plus /= w_plus.sum()
+            
+            obj_plus = self.objective_function(w_plus, returns, cov_matrix)
+            obj_base = self.objective_function(weights, returns, cov_matrix)
+            grad[i] = (obj_plus - obj_base) / eps
+        
+        return grad
+
+class CVaRObjective(Objective):
+    def __init__(self, confidence=0.05, lookback=252):
+        self.confidence = confidence
+        self.lookback = lookback
+    
+    def objective_function(self, weights, returns, cov_matrix, **kwargs):
+        # minimize negative conditional var
+        if len(returns) < self.lookback:
+            sample_rets = returns
+        else:
+            sample_rets = returns.tail(self.lookback)
+        
+        port_rets = sample_rets.values @ weights
+        var_threshold = np.percentile(port_rets, self.confidence * 100)
+        cvar = np.mean(port_rets[port_rets <= var_threshold])
+        
+        return -cvar  # minimize negative cvar
+    
+    def gradient(self, weights, returns, cov_matrix, **kwargs):
+        # numerical gradient
+        eps = 1e-6
+        grad = np.zeros(len(weights))
+        
+        for i in range(len(weights)):
+            w_plus = weights.copy()
+            w_minus = weights.copy()
+            w_plus[i] += eps
+            w_minus[i] -= eps
+            
+            w_plus /= w_plus.sum()
+            w_minus /= w_minus.sum()
+            
+            obj_plus = self.objective_function(w_plus, returns, cov_matrix)
+            obj_minus = self.objective_function(w_minus, returns, cov_matrix)
+            grad[i] = (obj_plus - obj_minus) / (2 * eps)
+        
+        return grad
+
+class BlackLitterman:
+    def __init__(self, risk_aversion=3.0, tau=0.025):
+        self.risk_aversion = risk_aversion
+        self.tau = tau
+        
+    def calc_implied_returns(self, market_caps, cov_matrix):
+        # market portfolio weights
+        w_market = (market_caps / market_caps.sum()).values
+        # implied returns: lambda * sigma * w_market
+        implied_rets = self.risk_aversion * cov_matrix @ w_market
+        return implied_rets
+    
+    def incorporate_views(self, implied_rets, cov_matrix, views, asset_names):
+        n_assets = len(asset_names)
+        n_views = len(views)
+        
+        if n_views == 0:
+            return implied_rets, cov_matrix
+        
+        # view matrix P and view vector Q
+        P = np.zeros((n_views, n_assets))
+        Q = np.zeros(n_views)
+        
+        for i, view in enumerate(views):
+            Q[i] = view.expected_return
+            
+            if view.view_type == 'absolute':
+                if len(view.assets) == 1:
+                    asset_idx = asset_names.index(view.assets[0])
+                    P[i, asset_idx] = 1.0
+            elif view.view_type == 'relative':
+                if len(view.assets) == 2:
+                    idx1 = asset_names.index(view.assets[0])
+                    idx2 = asset_names.index(view.assets[1])
+                    P[i, idx1] = 1.0
+                    P[i, idx2] = -1.0
+        
+        # view uncertainty
+        Omega = np.diag([self.tau * view.confidence for view in views])
+        
+        # black-litterman formula
+        tau_sigma = self.tau * cov_matrix
+        
+        M1 = linalg.inv(tau_sigma)
+        M2 = P.T @ linalg.inv(Omega) @ P
+        M3 = linalg.inv(tau_sigma) @ implied_rets + P.T @ linalg.inv(Omega) @ Q
+        
+        mu_bl = linalg.inv(M1 + M2) @ M3
+        cov_bl = linalg.inv(M1 + M2)
+        
+        return mu_bl, cov_bl
+
+class PortfolioOptimizer:
+    def __init__(self, risk_model=None, objective=None):
+        self.risk_model = risk_model or SampleCovariance()
+        self.objective = objective or MeanVariance()
+        self.history = []
+        
+    def get_data(self, symbols, start_date, end_date):
+        print(f"Getting data for {len(symbols)} assets...")
+        
+        data = {}
+        for sym in symbols:
+            try:
+                ticker = yf.Ticker(sym)
+                hist = ticker.history(start=start_date, end=end_date)
+                if len(hist) > 50:
+                    data[sym] = hist['Close']
+                else:
+                    print(f"Not enough data for {sym}")
+            except Exception as e:
+                print(f"Error with {sym}: {e}")
+        
+        # align and calc returns
+        prices = pd.DataFrame(data).dropna()
+        returns = prices.pct_change().dropna()
+        
+        print(f"Got data for {len(returns.columns)} assets")
+        print(f"Period: {returns.index[0].date()} to {returns.index[-1].date()}")
+        
+        return returns
+    
+    def optimize(self, returns, constraints=None, initial_weights=None):
+        n_assets = len(returns.columns)
+        asset_names = list(returns.columns)
+        
+        if constraints is None:
+            constraints = Constraints()
+        
+        if initial_weights is None:
+            initial_weights = np.ones(n_assets) / n_assets
+        
+        # estimate covariance
+        cov_matrix = self.risk_model.estimate_covariance(returns)
+        
+        # constraints
+        constraint_list = []
+        
+        # weights sum to 1
+        constraint_list.append({
+            'type': 'eq',
+            'fun': lambda w: np.sum(w) - 1.0
+        })
+        
+        # bounds
+        bounds = []
+        for i, asset in enumerate(asset_names):
+            min_w = constraints.min_weights.get(asset, 0.0 if constraints.long_only else -1.0)
+            max_w = constraints.max_weights.get(asset, 1.0)
+            bounds.append((min_w, max_w))
+        
+        # concentration limit
+        if constraints.max_concentration:
+            for i in range(n_assets):
+                constraint_list.append({
+                    'type': 'ineq',
+                    'fun': lambda w, idx=i: constraints.max_concentration - w[idx]
+                })
+        
+        # leverage limit
+        if not constraints.long_only:
+            constraint_list.append({
+                'type': 'ineq',
+                'fun': lambda w: constraints.leverage_limit - np.sum(np.abs(w))
+            })
+        
+        # objective wrapper
+        def obj_wrapper(weights):
+            return self.objective.objective_function(weights, returns, cov_matrix)
+        
+        def grad_wrapper(weights):
+            return self.objective.gradient(weights, returns, cov_matrix)
+        
+        # optimize
+        start_time = datetime.now()
+        
+        try:
+            result = optimize.minimize(
+                obj_wrapper,
+                initial_weights,
+                method='SLSQP',
+                jac=grad_wrapper,
+                bounds=bounds,
+                constraints=constraint_list,
+                options={'maxiter': 1000, 'ftol': 1e-9}
+            )
+            
+            opt_time = (datetime.now() - start_time).total_seconds()
+            
+            if result.success:
+                weights = result.x
+            else:
+                print(f"Optimization warning: {result.message}")
+                weights = result.x
+            
+            # calc metrics
+            metrics = self._calc_metrics(weights, returns, cov_matrix)
+            risk_decomp = self._risk_decomp(weights, cov_matrix, asset_names)
+            
+            opt_result = {
+                'weights': pd.Series(weights, index=asset_names),
+                'metrics': metrics,
+                'risk_decomp': risk_decomp,
+                'opt_info': {
+                    'success': result.success,
+                    'message': result.message,
+                    'iterations': result.nit,
+                    'time': opt_time
+                },
+                'cov_matrix': pd.DataFrame(cov_matrix, index=asset_names, columns=asset_names)
+            }
+            
+            self.history.append(opt_result)
+            return opt_result
+            
+        except Exception as e:
+            print(f"Optimization failed: {e}")
+            return None
+    
+    def efficient_frontier(self, returns, n_points=20, constraints=None):
+        print("Building efficient frontier...")
+        
+        original_obj = self.objective
+        frontier_results = []
+        
+        # risk aversion range
+        risk_aversions = np.logspace(-2, 2, n_points)
+        
+        for risk_aversion in risk_aversions:
+            self.objective = MeanVariance(risk_aversion=risk_aversion)
+            result = self.optimize(returns, constraints)
+            
+            if result is not None:
+                frontier_results.append({
+                    'risk_aversion': risk_aversion,
+                    'expected_return': result['metrics']['expected_return'],
+                    'volatility': result['metrics']['volatility'],
+                    'sharpe_ratio': result['metrics']['sharpe_ratio'],
+                    'max_weight': result['weights'].max(),
+                    'n_positions': (result['weights'] > 0.01).sum()
+                })
+        
+        self.objective = original_obj
+        return pd.DataFrame(frontier_results)
+    
+    def _calc_metrics(self, weights, returns, cov_matrix):
+        expected_rets = returns.mean().values * 252  # annualized
+        
+        port_return = weights @ expected_rets
+        port_variance = weights @ cov_matrix @ weights
+        port_vol = np.sqrt(port_variance * 252)
+        
+        sharpe = port_return / port_vol if port_vol > 0 else 0
+        
+        # diversification
+        concentration = np.sum(weights**2)
+        effective_n = 1 / concentration
+        
+        # downside risk
+        port_rets = returns.values @ weights
+        downside_rets = port_rets[port_rets < 0]
+        downside_vol = np.std(downside_rets) * np.sqrt(252) if len(downside_rets) > 0 else 0
+        sortino = port_return / downside_vol if downside_vol > 0 else 0
+        
+        # var and cvar
+        var95 = np.percentile(port_rets, 5) * np.sqrt(252)
+        cvar95 = np.mean(port_rets[port_rets <= np.percentile(port_rets, 5)]) * np.sqrt(252)
+        
+        return {
+            'expected_return': port_return,
+            'volatility': port_vol,
+            'sharpe_ratio': sharpe,
+            'sortino_ratio': sortino,
+            'max_drawdown': self._calc_max_dd(port_rets),
+            'var95': var95,
+            'cvar95': cvar95,
+            'concentration': concentration,
+            'effective_n_stocks': effective_n,
+            'turnover': np.sum(np.abs(weights))
+        }
+    
+    def _calc_max_dd(self, returns):
+        cumulative = np.cumprod(1 + returns)
+        running_max = np.maximum.accumulate(cumulative)
+        drawdown = (cumulative - running_max) / running_max
+        return np.min(drawdown)
+    
+    def _risk_decomp(self, weights, cov_matrix, asset_names):
+        port_variance = weights @ cov_matrix @ weights
+        marginal_contrib = cov_matrix @ weights
+        risk_contrib = weights * marginal_contrib / port_variance
+        
+        return {
+            'marginal_risk': pd.Series(marginal_contrib, index=asset_names),
+            'component_risk': pd.Series(risk_contrib, index=asset_names),
+            'risk_percentage': pd.Series(risk_contrib * 100, index=asset_names)
+        }
+    
+    def backtest(self, returns, rebal_freq='M', lookback=252, constraints=None):
+        print(f"Backtesting with {rebal_freq} rebalancing...")
+        
+        rebal_dates = returns.resample(rebal_freq).last().index[lookback:]
+        results = []
+        current_weights = None
+        
+        for i, date in enumerate(rebal_dates):
+            # training data
+            end_idx = returns.index.get_loc(date)
+            start_idx = max(0, end_idx - lookback)
+            training_data = returns.iloc[start_idx:end_idx]
+            
+            if len(training_data) < 50:
+                continue
+            
+            # optimize
+            opt_result = self.optimize(training_data, constraints)
+            if opt_result is None:
+                continue
+            
+            new_weights = opt_result['weights']
+            
+            # calc turnover
+            if i == 0:
+                current_weights = new_weights
+                turnover = np.sum(np.abs(new_weights))
+            else:
+                turnover = np.sum(np.abs(new_weights - current_weights))
+                current_weights = new_weights
+            
+            # performance for this period
+            next_idx = i + 1 if i + 1 < len(rebal_dates) else None
+            if next_idx is not None:
+                next_date = rebal_dates[next_idx]
+                period_rets = returns.loc[date:next_date]
+            else:
+                period_rets = returns.loc[date:]
+            
+            if len(period_rets) > 1:
+                port_ret = (period_rets.iloc[1:] @ current_weights).sum()
+                
+                results.append({
+                    'date': date,
+                    'portfolio_return': port_ret,
+                    'turnover': turnover,
+                    'max_weight': current_weights.max(),
+                    'n_positions': (current_weights > 0.01).sum(),
+                    'concentration': np.sum(current_weights**2),
+                    **{f'weight_{asset}': weight for asset, weight in current_weights.items()}
+                })
+        
+        return pd.DataFrame(results).set_index('date')
+    
+    def plot_results(self, result, show_risk=True):
+        weights = result['weights']
+        risk_decomp = result['risk_decomp']
+        
+        n_plots = 3 if show_risk else 2
+        fig, axes = plt.subplots(1, n_plots, figsize=(15, 5))
+        
+        # weights
+        weights_plot = weights[weights.abs() > 0.001]
+        axes[0].bar(range(len(weights_plot)), weights_plot.values)
+        axes[0].set_title('Portfolio Weights')
+        axes[0].set_xticks(range(len(weights_plot)))
+        axes[0].set_xticklabels(weights_plot.index, rotation=45)
+        axes[0].grid(True, alpha=0.3)
+        
+        # metrics
+        metrics = result['metrics']
+        metric_names = ['Return', 'Vol', 'Sharpe', 'Max DD', 'Concentration']
+        metric_vals = [metrics['expected_return'], metrics['volatility'], 
+                      metrics['sharpe_ratio'], metrics['max_drawdown'], 
+                      metrics['concentration']]
+        
+        axes[1].bar(metric_names, metric_vals)
+        axes[1].set_title('Portfolio Metrics')
+        axes[1].tick_params(axis='x', rotation=45)
+        axes[1].grid(True, alpha=0.3)
+        
+        # risk decomposition
+        if show_risk and len(axes) > 2:
+            risk_contrib = risk_decomp['risk_percentage']
+            risk_plot = risk_contrib[risk_contrib.abs() > 0.1]
+            
+            axes[2].bar(range(len(risk_plot)), risk_plot.values)
+            axes[2].set_title('Risk Contribution %')
+            axes[2].set_xticks(range(len(risk_plot)))
+            axes[2].set_xticklabels(risk_plot.index, rotation=45)
+            axes[2].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+    
+    def plot_frontier(self, frontier_data):
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+        
+        # efficient frontier
+        ax1.plot(frontier_data['volatility'], frontier_data['expected_return'], 
+                'b-', linewidth=2, marker='o')
+        ax1.set_xlabel('Volatility')
+        ax1.set_ylabel('Expected Return')
+        ax1.set_title('Efficient Frontier')
+        ax1.grid(True, alpha=0.3)
+        
+        # max sharpe annotation
+        max_sharpe_idx = frontier_data['sharpe_ratio'].idxmax()
+        ax1.annotate(f'Max Sharpe: {frontier_data.loc[max_sharpe_idx, "sharpe_ratio"]:.2f}',
+                    xy=(frontier_data.loc[max_sharpe_idx, 'volatility'], 
+                        frontier_data.loc[max_sharpe_idx, 'expected_return']),
+                    xytext=(10, 10), textcoords='offset points',
+                    bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7))
+        
+        # portfolio stats
+        ax2.plot(frontier_data['volatility'], frontier_data['sharpe_ratio'], 
+                'g-', linewidth=2, label='Sharpe Ratio')
+        ax2.plot(frontier_data['volatility'], frontier_data['max_weight'], 
+                'r--', linewidth=2, label='Max Weight')
+        ax2.set_xlabel('Volatility')
+        ax2.set_ylabel('Ratio/Weight')
+        ax2.set_title('Portfolio Stats')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.show()
+
+def main():
+    print("Portfolio Optimization Engine")
+    print("=============================\n")
+    
+    # asset universe
+    symbols = ['AAPL', 'GOOGL', 'MSFT', 'AMZN', 'TSLA', 'SPY', 'QQQ', 'EFA', 'EEM', 'TLT', 'GLD']
+    
+    # setup optimizer
+    risk_model = FactorModel(n_factors=3)
+    objective = MeanVariance(risk_aversion=2.0)
+    optimizer = PortfolioOptimizer(risk_model=risk_model, objective=objective)
+    
+    # get data
+    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=3*365)).strftime('%Y-%m-%d')
+    
+    returns = optimizer.get_data(symbols, start_date, end_date)
+    
+    # constraints
+    constraints = Constraints(
+        max_weights={sym: 0.15 for sym in symbols},
+        min_weights={sym: 0.0 for sym in symbols},
+        max_concentration=0.15,
+        long_only=True
+    )
+    
+    # 1. basic optimization
+    print("1. Basic Optimization:")
+    result = optimizer.optimize(returns, constraints)
+    
+    if result:
+        print("\nWeights:")
+        sig_weights = result['weights'][result['weights'] > 0.01]
+        for asset, weight in sig_weights.items():
+            print(f"   {asset}: {weight:.2%}")
+        
+        print(f"\nMetrics:")
+        m = result['metrics']
+        print(f"   Return: {m['expected_return']:.2%}")
+        print(f"   Vol: {m['volatility']:.2%}")
+        print(f"   Sharpe: {m['sharpe_ratio']:.2f}")
+        print(f"   Max DD: {m['max_drawdown']:.2%}")
+        
+        optimizer.plot_results(result)
+    
+    # 2. efficient frontier
+    print("\n2. Efficient Frontier:")
+    frontier = optimizer.efficient_frontier(returns, n_points=15, constraints=constraints)
+    print(f"Built {len(frontier)} frontier points")
+    
+    optimizer.plot_frontier(frontier)
+    
+    # 3. risk parity
+    print("\n3. Risk Parity:")
+    optimizer.objective = RiskParity()
+    rp_result = optimizer.optimize(returns, constraints)
+    
+    if rp_result:
+        print("Weights:")
+        sig_weights = rp_result['weights'][rp_result['weights'] > 0.01]
+        for asset, weight in sig_weights.items():
+            print(f"   {asset}: {weight:.2%}")
+    
+    # 4. cvar optimization
+    print("\n4. CVaR Optimization:")
+    optimizer.objective = CVaRObjective(confidence=0.05)
+    cvar_result = optimizer.optimize(returns, constraints)
+    
+    if cvar_result:
+        print("CVaR Weights:")
+        sig_weights = cvar_result['weights'][cvar_result['weights'] > 0.01]
+        for asset, weight in sig_weights.items():
+            print(f"   {asset}: {weight:.2%}")
+        
+        print(f"CVaR: {cvar_result['metrics']['cvar95']:.2%}")
+    
+    # 5. backtest
+    print("\n5. Strategy Backtest:")
+    optimizer.objective = MeanVariance(risk_aversion=2.0)
+    
+    backtest_data = returns.tail(252)
+    backtest_results = optimizer.backtest(
+        backtest_data, 
+        rebal_freq='M',
+        lookback=126,
+        constraints=constraints
+    )
+    
+    if len(backtest_results) > 0:
+        total_ret = backtest_results['portfolio_return'].sum()
+        avg_turnover = backtest_results['turnover'].mean()
+        
+        print(f"Total return: {total_ret:.2%}")
+        print(f"Avg turnover: {avg_turnover:.2%}")
+        print(f"Avg positions: {backtest_results['n_positions'].mean():.1f}")
+    
+    print("\nDone!")
+
+if __name__ == "__main__":
+    main()
